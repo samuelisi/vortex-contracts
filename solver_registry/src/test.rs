@@ -7,9 +7,12 @@
 //! boundary transitions (score exactly on a threshold), tier demotion on
 //! slash, the zero-fills edge case, and threshold tuning bounds.
 
-use crate::{Error, SolverRecord, SolverRegistry, SolverRegistryClient, USDC};
+use crate::{
+    Error, SolverRecord, SolverRegistry, SolverRegistryClient, USDC, WRITER_TIMELOCK_DELAY,
+};
 use soroban_sdk::{
-    testutils::Address as _, token, Address, Env,
+    testutils::{Address as _, Ledger},
+    token, Address, Env,
 };
 
 const FLOOR: i128 = 50 * USDC; // tier-0 (Unranked) bond floor
@@ -304,6 +307,146 @@ fn writer_can_drive_write_path_and_strangers_cannot() {
             .try_record_fill(&stranger, &ctx.solver, &0),
         Err(Ok(Error::Unauthorized.into()))
     );
+}
+
+// ─── Timelocked writer rotation (#389) ─────────────────────────────────────
+
+fn advance(ctx: &Ctx, secs: u64) {
+    let now = ctx.env.ledger().timestamp();
+    ctx.env.ledger().set_timestamp(now + secs);
+}
+
+#[test]
+fn set_writer_only_bootstraps_the_first_writer() {
+    let ctx = setup();
+    let c = ctx.client();
+    let first = Address::generate(&ctx.env);
+    c.set_writer(&first);
+    // Rotation can no longer bypass the timelock through set_writer.
+    assert_eq!(
+        c.try_set_writer(&Address::generate(&ctx.env)),
+        Err(Ok(Error::WriterAlreadySet.into()))
+    );
+    assert_eq!(c.get_writer(), Some(first));
+}
+
+#[test]
+fn writer_rotation_waits_for_the_timelock() {
+    let ctx = setup();
+    ctx.register(FLOOR);
+    let c = ctx.client();
+    let old = Address::generate(&ctx.env);
+    let new = Address::generate(&ctx.env);
+    c.set_writer(&old);
+
+    let proposed_at = ctx.env.ledger().timestamp();
+    c.propose_writer(&new);
+    let eta = proposed_at + WRITER_TIMELOCK_DELAY;
+    assert_eq!(c.get_pending_writer(), Some((new.clone(), eta)));
+
+    // One second early: rejected, and the old writer is still in charge.
+    advance(&ctx, WRITER_TIMELOCK_DELAY - 1);
+    assert_eq!(
+        c.try_execute_writer(&new),
+        Err(Ok(Error::TimelockNotElapsed.into()))
+    );
+    assert_eq!(c.get_writer(), Some(old.clone()));
+    c.record_fill(&old, &ctx.solver, &0);
+
+    // Exactly at the eta: applied.
+    advance(&ctx, 1);
+    c.execute_writer(&new);
+    assert_eq!(c.get_writer(), Some(new.clone()));
+    assert_eq!(c.get_pending_writer(), None);
+
+    // The old writer lost the write path; the new one has it.
+    assert_eq!(
+        c.try_record_fill(&old, &ctx.solver, &0),
+        Err(Ok(Error::Unauthorized.into()))
+    );
+    c.record_fill(&new, &ctx.solver, &0);
+}
+
+#[test]
+fn execute_writer_must_match_the_proposal() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_writer(&Address::generate(&ctx.env));
+    let proposed = Address::generate(&ctx.env);
+    c.propose_writer(&proposed);
+    advance(&ctx, WRITER_TIMELOCK_DELAY);
+    assert_eq!(
+        c.try_execute_writer(&Address::generate(&ctx.env)),
+        Err(Ok(Error::Unauthorized.into()))
+    );
+}
+
+#[test]
+fn a_new_proposal_replaces_the_old_one_and_resets_the_timelock() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_writer(&Address::generate(&ctx.env));
+    let first = Address::generate(&ctx.env);
+    let second = Address::generate(&ctx.env);
+
+    c.propose_writer(&first);
+    advance(&ctx, WRITER_TIMELOCK_DELAY - 10);
+    c.propose_writer(&second);
+    advance(&ctx, 10);
+
+    // The first proposal is gone, and the second hasn't aged enough.
+    assert_eq!(
+        c.try_execute_writer(&first),
+        Err(Ok(Error::Unauthorized.into()))
+    );
+    assert_eq!(
+        c.try_execute_writer(&second),
+        Err(Ok(Error::TimelockNotElapsed.into()))
+    );
+    advance(&ctx, WRITER_TIMELOCK_DELAY);
+    c.execute_writer(&second);
+    assert_eq!(c.get_writer(), Some(second));
+}
+
+#[test]
+fn cancel_writer_discards_the_pending_rotation() {
+    let ctx = setup();
+    let c = ctx.client();
+    let current = Address::generate(&ctx.env);
+    c.set_writer(&current);
+    assert_eq!(
+        c.try_cancel_writer(),
+        Err(Ok(Error::NoPendingWriter.into()))
+    );
+
+    let proposed = Address::generate(&ctx.env);
+    c.propose_writer(&proposed);
+    c.cancel_writer();
+    assert_eq!(c.get_pending_writer(), None);
+
+    advance(&ctx, WRITER_TIMELOCK_DELAY);
+    assert_eq!(
+        c.try_execute_writer(&proposed),
+        Err(Ok(Error::NoPendingWriter.into()))
+    );
+    assert_eq!(c.get_writer(), Some(current));
+}
+
+#[test]
+fn writer_rotation_requires_admin_auth() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_writer(&Address::generate(&ctx.env));
+    let proposed = Address::generate(&ctx.env);
+    c.propose_writer(&proposed);
+    advance(&ctx, WRITER_TIMELOCK_DELAY);
+
+    // Drop the blanket auth mock: the admin has not signed.
+    ctx.env.set_auths(&[]);
+    assert!(c.try_propose_writer(&Address::generate(&ctx.env)).is_err());
+    assert!(c.try_execute_writer(&proposed).is_err());
+    assert!(c.try_cancel_writer().is_err());
+    assert_eq!(c.get_pending_writer().map(|(w, _)| w), Some(proposed));
 }
 
 // ─── Tier demotion on slash ────────────────────────────────────────────────
