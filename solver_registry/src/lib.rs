@@ -21,8 +21,8 @@
 //! test module is the shared cross-check.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
+    Env, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -106,6 +106,16 @@ pub enum DataKey {
     TotalSolvers,
     /// Persistent: per-solver record.
     Solver(Address),
+    /// Persistent: presence means the write `action` (`fill`, `failure` or
+    /// `slash`) was already applied for `intent_id` (issue #390). Makes each
+    /// settlement write exactly-once per intent.
+    Recorded(Symbol, BytesN<32>),
+    /// Persistent: presence means `solver` holds an open obligation for
+    /// `intent_id` in settlement (issue #392). Keyed per intent so
+    /// `lock_obligation` / `release_obligation` are idempotent.
+    Obligation(Address, BytesN<32>),
+    /// Persistent: number of open obligations (`u32`) held by a solver.
+    OpenObligations(Address),
 }
 
 /// One row of the tunable part of the tier table.
@@ -181,6 +191,8 @@ pub enum Error {
     /// `set_writer` called once a writer exists; rotation goes through
     /// `propose_writer` / `execute_writer`.
     WriterAlreadySet = 15,
+    /// This write was already applied for this `intent_id` (issue #390).
+    AlreadyRecorded = 16,
 }
 
 // ─── Reputation formula ──────────────────────────────────────────────────────
@@ -530,14 +542,22 @@ impl SolverRegistry {
 
     // ── Settlement write path (writer or admin) ─────────────────────────────
 
-    /// Record a successful fill of `amount` (dst-token units) by `solver`.
-    /// `caller` must be the configured writer or the admin.
-    pub fn record_fill(env: Env, caller: Address, solver: Address, amount: i128) {
+    /// Record a successful fill of `amount` (dst-token units) by `solver`
+    /// for `intent_id`. `caller` must be the configured writer or the admin.
+    /// Exactly once per intent: a repeat fails with `AlreadyRecorded`.
+    pub fn record_fill(
+        env: Env,
+        caller: Address,
+        solver: Address,
+        intent_id: BytesN<32>,
+        amount: i128,
+    ) {
         Self::require_writer_or_admin(&env, &caller);
         if amount < 0 {
             panic_with_error!(&env, Error::ZeroAmount);
         }
         let mut record = Self::load_solver(&env, &solver);
+        Self::mark_recorded(&env, "fill", &intent_id);
         record.fills_completed += 1;
         record.total_volume += amount;
         env.storage()
@@ -550,11 +570,13 @@ impl SolverRegistry {
         );
     }
 
-    /// Record a failed fill by `solver` (no slash — that is `slash`).
-    /// `caller` must be the configured writer or the admin.
-    pub fn record_failure(env: Env, caller: Address, solver: Address) {
+    /// Record a failed fill by `solver` for `intent_id` (no slash — that is
+    /// `slash`). `caller` must be the configured writer or the admin.
+    /// Exactly once per intent: a repeat fails with `AlreadyRecorded`.
+    pub fn record_failure(env: Env, caller: Address, solver: Address, intent_id: BytesN<32>) {
         Self::require_writer_or_admin(&env, &caller);
         let mut record = Self::load_solver(&env, &solver);
+        Self::mark_recorded(&env, "failure", &intent_id);
         record.fills_failed += 1;
         env.storage()
             .persistent()
@@ -570,10 +592,12 @@ impl SolverRegistry {
     /// unit), transfer it to the fee recipient, and record a failed fill.
     ///
     /// Returns `(slash_amount, new_tier)`. `caller` must be the configured
-    /// writer or the admin.
-    pub fn slash(env: Env, caller: Address, solver: Address) -> (i128, u32) {
+    /// writer or the admin. Exactly once per `intent_id`: a repeat fails with
+    /// `AlreadyRecorded`, so a retry can't double-slash.
+    pub fn slash(env: Env, caller: Address, solver: Address, intent_id: BytesN<32>) -> (i128, u32) {
         Self::require_writer_or_admin(&env, &caller);
         let mut record = Self::load_solver(&env, &solver);
+        Self::mark_recorded(&env, "slash", &intent_id);
 
         let tier_before = Self::tier_of(&env, &record);
         let bps = SLASH_BPS[tier_before as usize] as i128;
@@ -613,7 +637,94 @@ impl SolverRegistry {
         (slash_amount, new_tier)
     }
 
+    // ── Obligation locks (writer only) ──────────────────────────────────────
+
+    /// Record that `solver` holds an open obligation for `intent_id` (called
+    /// by settlement when the solver accepts the intent). Idempotent per
+    /// intent: locking an intent that is already locked leaves the count
+    /// unchanged. Returns the solver's open-obligation count.
+    ///
+    /// `caller` must be the configured writer; unlike `record_fill`, the
+    /// admin cannot drive this path, so obligations only reflect real
+    /// settlement state.
+    pub fn lock_obligation(
+        env: Env,
+        caller: Address,
+        solver: Address,
+        intent_id: BytesN<32>,
+    ) -> u32 {
+        Self::require_writer(&env, &caller);
+        // Only registered solvers can accept intents.
+        Self::load_solver(&env, &solver);
+
+        let key = DataKey::Obligation(solver.clone(), intent_id.clone());
+        let mut count = Self::open_obligations(&env, &solver);
+        if env.storage().persistent().has(&key) {
+            return count;
+        }
+        count += 1;
+        env.storage().persistent().set(&key, &true);
+        Self::bump_persistent_ttl(&env, &key);
+        Self::store_open_obligations(&env, &solver, count);
+        env.events().publish(
+            (Symbol::new(&env, "obligation_locked"), solver),
+            (intent_id, count),
+        );
+        count
+    }
+
+    /// Clear `solver`'s obligation for `intent_id` (called by settlement on
+    /// fill, slash, or re-open). Idempotent per intent: releasing an intent
+    /// that is not locked leaves the count unchanged. Does not require the
+    /// solver to still be registered, so a stale lock can always be cleared.
+    /// Returns the solver's open-obligation count.
+    ///
+    /// `caller` must be the configured writer.
+    pub fn release_obligation(
+        env: Env,
+        caller: Address,
+        solver: Address,
+        intent_id: BytesN<32>,
+    ) -> u32 {
+        Self::require_writer(&env, &caller);
+
+        let key = DataKey::Obligation(solver.clone(), intent_id.clone());
+        let mut count = Self::open_obligations(&env, &solver);
+        if !env.storage().persistent().has(&key) {
+            return count;
+        }
+        env.storage().persistent().remove(&key);
+        count = count.saturating_sub(1);
+        Self::store_open_obligations(&env, &solver, count);
+        env.events().publish(
+            (Symbol::new(&env, "obligation_released"), solver),
+            (intent_id, count),
+        );
+        count
+    }
+
+    /// Number of open obligations `solver` holds in settlement (0 if none).
+    pub fn get_open_obligations(env: Env, solver: Address) -> u32 {
+        Self::open_obligations(&env, &solver)
+    }
+
+    /// `true` iff `solver` holds an open obligation for `intent_id`.
+    pub fn has_obligation(env: Env, solver: Address, intent_id: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Obligation(solver, intent_id))
+    }
+
     // ── Views ───────────────────────────────────────────────────────────────
+
+    /// `true` iff the write `action` (`fill`, `failure` or `slash`) was
+    /// already applied for `intent_id`, so settlement can check before
+    /// retrying.
+    pub fn is_intent_recorded(env: Env, action: Symbol, intent_id: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Recorded(action, intent_id))
+    }
 
     /// Current tier (0..=4) for `solver`. Unknown solver → 0.
     pub fn get_tier(env: Env, solver: Address) -> u32 {
@@ -791,6 +902,81 @@ impl SolverRegistry {
             }
         }
         caller.require_auth();
+    }
+
+    /// Claim the idempotency key for `action` on `intent_id`, failing with
+    /// `AlreadyRecorded` if that write was already applied. Keys are per
+    /// action, so e.g. `record_failure` and `slash` for the same intent are
+    /// independent writes.
+    fn mark_recorded(env: &Env, action: &str, intent_id: &BytesN<32>) {
+        let key = DataKey::Recorded(Symbol::new(env, action), intent_id.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(env, Error::AlreadyRecorded);
+        }
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// Strict writer check for the obligation path: the writer must be
+    /// configured and `caller` must be it (the admin is not accepted).
+    fn require_writer(env: &Env, caller: &Address) {
+        let writer: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Writer)
+            .unwrap_or_else(|| panic_with_error!(env, Error::WriterNotSet));
+        if *caller != writer {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
+    }
+
+    fn open_obligations(env: &Env, solver: &Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OpenObligations(solver.clone()))
+            .unwrap_or(0)
+    }
+
+    fn store_open_obligations(env: &Env, solver: &Address, count: u32) {
+        let key = DataKey::OpenObligations(solver.clone());
+        if count == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &count);
+            Self::bump_persistent_ttl(env, &key);
+        }
+    }
+
+    fn bump_persistent_ttl(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
+
+    fn bump_solver_ttl(env: &Env, solver: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Solver(solver.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+}
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
     }
 
     fn bump_instance_ttl(env: &Env) {
